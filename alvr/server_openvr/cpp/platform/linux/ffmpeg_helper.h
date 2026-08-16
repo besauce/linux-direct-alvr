@@ -92,12 +92,19 @@ public:
     ~HWContext() { av_buffer_unref(&avCtx); }
 };
 
+// Wraps an image's parameters as an AV_PIX_FMT_VULKAN frames context, so a
+// VkFrame can be handed to ffmpeg as a real AVFrame. vulkanDevice is the
+// ffmpeg Vulkan device, HWContext::avCtx; the frames context takes its own
+// reference, so the HWContext may be a temporary.
 class VkFrameCtx {
 public:
-    VkFrameCtx(VkContext& vkContext, vk::ImageCreateInfo image_create_info);
+    VkFrameCtx(AVBufferRef* vulkanDevice, VkImageCreateInfo imageCI);
     ~VkFrameCtx();
 
-    AVBufferRef* ctx;
+    VkFrameCtx(VkFrameCtx const&) = delete;
+    VkFrameCtx& operator=(VkFrameCtx const&) = delete;
+
+    AVBufferRef* ctx = nullptr;
 };
 
 class VkFrame {
