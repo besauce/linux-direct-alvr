@@ -189,6 +189,17 @@ alvr::EncodePipelineNvEnc::~EncodePipelineNvEnc() {
     av_frame_free(&hw_frame);
 }
 
+void alvr::EncodePipelineNvEnc::SetParams(FfiDynamicEncoderParams params) {
+    if (!params.updated) {
+        return;
+    }
+    encoder_ctx->bit_rate = params.bitrate_bps;
+    encoder_ctx->framerate = AVRational { int(params.framerate * 1000), 1000 };
+    encoder_ctx->rc_buffer_size = encoder_ctx->bit_rate / params.framerate;
+    encoder_ctx->rc_max_rate = encoder_ctx->bit_rate;
+    encoder_ctx->rc_initial_buffer_occupancy = encoder_ctx->rc_buffer_size;
+}
+
 void alvr::EncodePipelineNvEnc::PushFrame(uint64_t targetTimestampNs, bool idr) {
     AVVkFrame* vkf = reinterpret_cast<AVVkFrame*>(vk_frame->data[0]);
     vkf->sem_value[0]++;

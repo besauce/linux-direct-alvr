@@ -8,6 +8,8 @@
 #include "ViveTrackerProxy.h"
 #include "bindings.h"
 #include <cfloat>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 
 #ifdef _WIN32
@@ -199,17 +201,35 @@ void Hmd::OnPoseUpdated(uint64_t targetTimestampNs, FfiDeviceMotion motion) {
             vr::Prop_DisplayFrequency_Float,
             static_cast<float>(Settings_Instance()->m_refreshRate)
         );
+        // One frame period. A streamed display has no measured panel latency
+        // to put here, so one frame is the honest placeholder, and setting the
+        // property explicitly rather than leaving it unset keeps pose
+        // prediction deterministic. ALVR compensates streaming latency in its
+        // own tracking path, so the extra link latency deliberately does NOT
+        // get folded in here.
+        vr::VRProperties()->SetFloatProperty(
+            this->prop_container,
+            vr::Prop_SecondsFromVsyncToPhotons_Float,
+            1.0f / static_cast<float>(Settings_Instance()->m_refreshRate)
+        );
     }
-    //TODO: make this linux only
-    //DEBUG: Linux Direct Mode driver needs this to be set to true, otherwise it will not work.
-    //This feels like a hacky solution, should be enalbed by default for drivers implementing DMC.
-    vr::VRProperties()->SetBoolProperty( this->prop_container, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, true );
-    //TODO: DO we truely need this? I think we do, but it is not clear. This is a hacky solution, but it works for now.
+    // True = SteamVR uses the timing of OUR VsyncEvent calls instead of its
+    // hardcoded 2.8 ms vsync-offset model (openvr v1.0.8 release notes). The
+    // driver fires VsyncEvent from PostPresent at running-start time with
+    // the seconds remaining until the tick, per the driver-direct-mode wiki.
+    // ALVR_NO_VSYNC_EVENTS=1 clears this and skips the events, reproducing
+    // the hardcoded-offset model the win32 driver runs full-rate on: the
+    // known-working fallback configuration for pacing experiments.
+    static const bool noVsyncEvents = [] {
+        const char* env = getenv("ALVR_NO_VSYNC_EVENTS");
+        return env != nullptr && strcmp(env, "0") != 0;
+    }();
+    vr::VRProperties()->SetBoolProperty( this->prop_container, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, !noVsyncEvents );
+    // Per the header: enables the per-app "Throttling Behavior" video
+    // settings UI and the Throttling_t hints delivered to PostPresent, which
+    // the pacing grid honors. Optional, but coherent with honoring hints.
     vr::VRProperties()->SetBoolProperty( this->prop_container, vr::Prop_Hmd_SupportsAppThrottling_Bool, true );
-    //TODO: Same as Prop_DriverDirectModeSendsVsyncEvents_Bool Property
     vr::VRProperties()->SetBoolProperty( this->prop_container, vr::Prop_SupportsXrTextureSets_Bool, true );
-    
-    //TODO: ????
     vr::VRProperties()->SetBoolProperty( this->prop_container, vr::Prop_Hmd_AllowsClientToControlTextureIndex, true );
 
 #endif
@@ -279,6 +299,10 @@ void Hmd::SetViewParams(const FfiViewParams params[2]) {
 #ifdef _WIN32
     if (m_encoder) {
         m_encoder->SetViewParams(left_proj, left_transform, right_proj, right_transform);
+    }
+#elif !defined(__APPLE__)
+    if (m_directModeComponent) {
+        m_directModeComponent->SetViewParams(params);
     }
 #endif
 

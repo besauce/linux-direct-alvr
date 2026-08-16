@@ -164,8 +164,17 @@ impl Launcher {
             if start_script.exists() {
                 debug!("Running VR server start script: {}", start_script.display());
 
-                if let Err(e) = Command::new(&start_script).spawn() {
-                    error!("Failed to run VR server start script: {e}");
+                // Reap the child: a zombie's pid still passes kill(pid, 0),
+                // which vrmonitor's single-instance check runs on its
+                // semaphore's last holder, so an unreaped child blocks every
+                // future launch until this process exits.
+                match Command::new(&start_script).spawn() {
+                    Ok(mut child) => {
+                        thread::spawn(move || {
+                            child.wait().ok();
+                        });
+                    }
+                    Err(e) => error!("Failed to run VR server start script: {e}"),
                 }
             } else if let Ok(steamvr_bin_dir) =
                 alvr_server_io::steamvr_root_dir().map(|root| root.join("bin"))
@@ -178,11 +187,17 @@ impl Launcher {
 
                 debug!("Launching SteamVR from path: {}", steamvr_path.display());
 
-                if let Err(e) = Command::new(&steamvr_path).spawn() {
-                    error!(
+                // Reap the child; same reason as the start-script branch.
+                match Command::new(&steamvr_path).spawn() {
+                    Ok(mut child) => {
+                        thread::spawn(move || {
+                            child.wait().ok();
+                        });
+                    }
+                    Err(e) => error!(
                         "Failed to run SteamVR from automatically detected path {} with error: {e}",
                         steamvr_path.display()
-                    );
+                    ),
                 }
             } else {
                 error!("Failed to find SteamVR files to directly launch SteamVR");

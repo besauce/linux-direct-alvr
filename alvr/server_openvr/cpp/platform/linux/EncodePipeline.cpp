@@ -11,17 +11,6 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
-// TODO: Uninheritance this
-void alvr::EncodePipeline::SetParams(FfiDynamicEncoderParams params) {
-    if (params.updated) {
-        encoder_ctx->bit_rate = params.bitrate_bps / params.framerate * 60.0;
-        encoder_ctx->framerate = AVRational { 60, 1 };
-        encoder_ctx->rc_buffer_size = encoder_ctx->bit_rate / 60.0 * 1.1;
-        encoder_ctx->rc_max_rate = encoder_ctx->bit_rate;
-        encoder_ctx->rc_initial_buffer_occupancy = encoder_ctx->rc_buffer_size / 4 * 3;
-    }
-}
-
 std::unique_ptr<alvr::EncodePipeline> alvr::EncodePipeline::Create(
     alvr::VkContext& vk_ctx,
     std::string devicePath,

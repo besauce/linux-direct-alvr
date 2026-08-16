@@ -263,6 +263,40 @@ pub fn build_launcher(profile: Profile, reproducible: bool) {
     .unwrap();
 }
 
+pub fn build_client_mock(profile: Profile, reproducible: bool) {
+    let sh = Shell::new().unwrap();
+
+    let mut common_flags = vec![];
+    match profile {
+        Profile::Distribution => {
+            common_flags.push("--profile");
+            common_flags.push("distribution");
+        }
+        Profile::Release => common_flags.push("--release"),
+        Profile::Debug => (),
+    }
+    if reproducible {
+        common_flags.push("--locked");
+    }
+    let common_flags_ref = &common_flags;
+
+    let build_dir = afs::build_dir().join("alvr_client_mock");
+    sh.create_dir(&build_dir).unwrap();
+
+    cmd!(sh, "cargo build -p alvr_client_mock {common_flags_ref...}")
+        .run()
+        .unwrap();
+
+    let exe_name = afs::exec_fname("alvr_client_mock");
+    sh.copy_file(
+        afs::target_dir()
+            .join(profile.to_string())
+            .join(&exe_name),
+        build_dir.join(exe_name),
+    )
+    .unwrap();
+}
+
 fn build_android_lib_impl(dir_name: &str, profile: Profile, link_stdcpp: bool, all_targets: bool) {
     let sh = Shell::new().unwrap();
 

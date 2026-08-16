@@ -2,8 +2,16 @@
 #include "Logger.h"
 #include "Utils.h"
 #include "include/openvr_math.h"
+#include <cstdlib>
 #include <mutex>
 #include <optional>
+
+PoseHistory::PoseHistory() {
+    const char* windowMs = getenv("ALVR_POSE_MATCH_WINDOW_MS");
+    if (windowMs != nullptr) {
+        m_matchWindowNs = (uint64_t)atoi(windowMs) * 1000000ull;
+    }
+}
 
 void PoseHistory::OnPoseUpdated(uint64_t targetTimestampNs, FfiDeviceMotion motion) {
     // Put pose history buffer
@@ -40,11 +48,27 @@ void PoseHistory::OnPoseUpdated(uint64_t targetTimestampNs, FfiDeviceMotion moti
 }
 
 std::optional<PoseHistory::TrackingHistoryFrame>
-PoseHistory::GetBestPoseMatch(const vr::HmdMatrix34_t& pose) const {
+PoseHistory::GetBestPoseMatch(const vr::HmdMatrix34_t& pose, float* outMinDiff) const {
     std::unique_lock<std::mutex> lock(m_mutex);
+    if (m_poseBuffer.empty()) {
+        Debug("PoseHistory::GetBestPoseMatch: No pose matched.");
+        return {};
+    }
+
+    // Search newest first. The buffer holds about 1.7 seconds of tracking, so
+    // when the head sweeps back over an orientation it recently held, several
+    // entries match the submitted pose equally well. Scanning oldest first
+    // returned the oldest of those, stamping the frame with a pose up to a
+    // second stale, which reads as a snap while sweeping. Ties now resolve to
+    // the most recent entry, and entries older than the search window are not
+    // considered at all (a rendered frame's pose is always recent).
+    const uint64_t newestTimestampNs = m_poseBuffer.back().targetTimestampNs;
     float minDiff = 100000;
-    auto minIt = m_poseBuffer.begin();
-    for (auto it = m_poseBuffer.begin(); it != m_poseBuffer.end(); ++it) {
+    auto minIt = m_poseBuffer.rbegin();
+    for (auto it = m_poseBuffer.rbegin(); it != m_poseBuffer.rend(); ++it) {
+        if (m_matchWindowNs != 0 && newestTimestampNs - it->targetTimestampNs > m_matchWindowNs) {
+            break;
+        }
         float distance = 0;
         // Rotation matrix composes a part of ViewMatrix of TrackingInfo.
         // Be carefull of transpose.
@@ -60,12 +84,18 @@ PoseHistory::GetBestPoseMatch(const vr::HmdMatrix34_t& pose) const {
             minDiff = distance;
         }
     }
-    if (minIt != m_poseBuffer.end()) {
-        return *minIt;
+    if (outMinDiff) {
+        *outMinDiff = minDiff;
     }
+    return *minIt;
+}
 
-    Debug("PoseHistory::GetBestPoseMatch: No pose matched.");
-    return {};
+std::optional<PoseHistory::TrackingHistoryFrame> PoseHistory::GetLatestPose() const {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    if (m_poseBuffer.empty()) {
+        return {};
+    }
+    return m_poseBuffer.back();
 }
 
 std::optional<PoseHistory::TrackingHistoryFrame> PoseHistory::GetPoseAt(uint64_t timestampNs

@@ -37,7 +37,7 @@ public:
     virtual Timestamp GetTimestamp() { return timestamp; }
     virtual int GetCodec();
 
-    virtual void SetParams(FfiDynamicEncoderParams params);
+    virtual void SetParams(FfiDynamicEncoderParams params) = 0;
     static std::unique_ptr<EncodePipeline> Create(
         alvr::VkContext& vk_ctx,
         std::string devicePath,

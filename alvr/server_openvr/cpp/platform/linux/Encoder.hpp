@@ -133,6 +133,8 @@ inline auto makeFoveation(Settings const& settings, vk::Extent2D extent) {
 
 class Encoder {
     vk::Extent2D outExtent;
+    vk::Extent2D lastInputEyeExtent {};
+    vk::Format lastInputFormat {};
 
     VkContext vkCtx;
 
@@ -142,6 +144,12 @@ class Encoder {
     std::unique_ptr<VkFrame> frame;
     bool encoderMissingLogged = false;
     IDRScheduler idrScheduler;
+
+    // Whether the current pass chain contains a shader with the warp fold
+    // (ffr.comp or quad.comp). A color-correction-only chain does not, and
+    // engaging the warp there would move the stamp while leaving the pixels
+    // unwarped, breaking stamp-equals-content.
+    bool warpCapableChain = false;
 
 public:
     // TODO: How are we supposed to match the physical device with direct mode?
@@ -179,11 +187,29 @@ public:
                     QUAD_SHADER_COMP_SPV_PTR, QUAD_SHADER_COMP_SPV_PTR + QUAD_SHADER_COMP_SPV_LEN
                 ),
             });
+            warpCapableChain = true;
+        } else {
+            warpCapableChain = settings->m_enableFoveatedEncoding;
         }
 
         outExtent = rendererCI.outputExtent;
+        lastInputEyeExtent = rendererCI.inputEyeExtent;
+        lastInputFormat = rendererCI.format;
         renderer.emplace(vkCtx, rendererCI, pipeCIs);
     }
+
+    // True when a new swap texture set can reuse the current pipeline: same
+    // per eye extent and format, renderer and encoder alive.
+    bool inputsCompatible(vk::Extent2D eyeExtent, vk::Format format) {
+        return renderer.hasValue() && encoder && lastInputEyeExtent.width == eyeExtent.width
+            && lastInputEyeExtent.height == eyeExtent.height && lastInputFormat == format;
+    }
+
+    // Swap only the imported input images; the render pipeline, output image
+    // and encoder stay up. render() waits its completion semaphore before
+    // returning, so the old imports are not in flight when called from the
+    // present thread.
+    void swapInputs(std::array<int, 6> const& fds) { renderer.get().swapInputs(vkCtx, fds); }
 
     void initEncoding() {
         auto const& settings = Settings_Instance();
@@ -228,7 +254,13 @@ public:
         // TODO: Fix Nvidia
 
         frame = std::make_unique<VkFrame>(
-            vkCtx, out.image.image, out.imageCI, out.size, out.image.memory, out.drm
+            vkCtx,
+            out.image.image,
+            out.imageCI,
+            out.size,
+            out.image.memory,
+            out.drm,
+            out.contentFormat
         );
 
         encoder
@@ -256,8 +288,27 @@ public:
         encoderMissingLogged = false;
     }
 
-    void present(u32 leftIdx, u32 rightIdx, u64 targetTimestampNs) {
+    // warp, when given, is pushed to the render passes for this frame; the
+    // caller has already moved targetTimestampNs to the warp target's
+    // timestamp when the warp engaged, so stamp and pixels stay one pose.
+    // waitFds are sync_file fds the render submission must wait on before
+    // reading the inputs (the writer's fences); ownership transfers here,
+    // and on into Vulkan when the import succeeds.
+    void present(
+        u32 leftIdx,
+        u32 rightIdx,
+        u64 targetTimestampNs,
+        render::WarpParams const* warp = nullptr,
+        int const waitFds[2] = nullptr
+    ) {
         if (!encoder) {
+            if (waitFds != nullptr) {
+                for (int e = 0; e < 2; ++e) {
+                    if (waitFds[e] >= 0) {
+                        close(waitFds[e]);
+                    }
+                }
+            }
             // Say it once instead of at frame rate.
             if (!encoderMissingLogged) {
                 Error("Encoder not initialized, skipping frames until it is rebuilt.\n");
@@ -265,15 +316,33 @@ public:
             }
             return;
         }
+        renderer.get().setWarpParams(warp != nullptr ? *warp : render::WarpParams {});
         ReportPresent(targetTimestampNs, 0);
-        renderer.get().render(vkCtx, leftIdx, rightIdx);
+        renderer.get().render(vkCtx, leftIdx, rightIdx, waitFds);
+        // Redundant while render() waits its own submission's timeline
+        // value; kept as the hook if submission ever goes async.
+        renderer.get().waitForRenderDone(vkCtx);
         ReportComposed(targetTimestampNs, 0);
+
+        // Feed the bitrate manager's current target to the encoder. Every
+        // Windows encoder polls this per frame; the Linux direct mode port
+        // never wired it, so the VAAPI pipeline sat at its hardcoded 30 Mbps
+        // construction default regardless of settings (measured 11-14.6 Mbps
+        // on the wire against a configured constant 80).
+        auto dynParams = GetDynamicEncoderParams();
+        if (dynParams.updated) {
+            encoder->SetParams(dynParams);
+        }
 
         encoder->PushFrame(0, idrScheduler.CheckIDRInsertion());
 
         alvr::FramePacket framePacket;
         if (!encoder->GetEncoded(framePacket)) {
-            assert(false);
+            // A false return is a normal encoder state (EAGAIN), not an
+            // error, and framePacket has no default initializers: parsing
+            // it here would hand an indeterminate pointer and size to the
+            // Rust side. Nothing to send this cycle.
+            return;
         }
 
         ParseFrameNals(
@@ -286,6 +355,11 @@ public:
     }
 
     void requestIdr() { idrScheduler.InsertIDR(); }
+
+    // True when engaging the warp actually warps pixels with the current
+    // pass chain. False also covers the encoder not being built yet.
+    // Non-const because Optional::hasValue() is not const-qualified.
+    bool warpCapable() { return renderer.hasValue() && warpCapableChain; }
 
     ~Encoder() {
         // The device dies in this body, but members are destroyed after the

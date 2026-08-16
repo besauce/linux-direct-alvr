@@ -108,13 +108,19 @@ public:
         VkImageCreateInfo image_info,
         VkDeviceSize size,
         VkDeviceMemory memory,
-        DrmImage drm
+        DrmImage drm,
+        VkFormat content_format
     );
     ~VkFrame();
     VkImage image() { return vkimage; }
     VkImageCreateInfo imageInfo() { return vkimageinfo; }
     VkFormat format() { return vkimageinfo.format; }
     AVPixelFormat avFormat() { return avformat; }
+    // Colorspace of the content as submitted (pre UNORM normalization).
+    AVColorPrimaries colorPrimaries() const;
+    AVColorTransferCharacteristic colorTransfer() const;
+    AVColorSpace colorSpace() const;
+    AVColorRange colorRange() const;
     operator AVVkFrame*() const { return av_vkframe; }
     operator AVDRMFrameDescriptor*() const { return av_drmframe; }
     std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> make_av_frame(VkFrameCtx& frame_ctx);
@@ -126,6 +132,7 @@ private:
     VkImage vkimage;
     VkImageCreateInfo vkimageinfo;
     AVPixelFormat avformat;
+    VkFormat contentformat;
 };
 
 }

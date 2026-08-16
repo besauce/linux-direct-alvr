@@ -28,6 +28,7 @@ public:
     );
 
     void PushFrame(uint64_t targetTimestampNs, bool idr) override;
+    void SetParams(FfiDynamicEncoderParams params) override;
 
 private:
     VkContext& v_ctx;

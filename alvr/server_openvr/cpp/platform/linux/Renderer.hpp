@@ -43,6 +43,9 @@ struct Output {
     // VkSemaphore semaphore;
     VkImageCreateInfo imageCI;
     VkDeviceSize size;
+    // Format SteamVR submitted, kept separate from imageCI.format which is
+    // normalized to UNORM for storage/FFmpeg/DRM compatibility.
+    VkFormat contentFormat;
 };
 
 struct PipelineCreateInfo {
@@ -50,6 +53,19 @@ struct PipelineCreateInfo {
     std::vector<vk::SpecializationMapEntry> specs;
     std::vector<u8> specData;
 };
+
+// Push-constant payload for the rotational reprojection fold in ffr.comp and
+// quad.comp. Field offsets must match the GLSL Rewarp block (0/64/80/96).
+// enabled == 0 reproduces the unwarped sampling exactly, so a zero-initialized
+// struct is a correct passthrough.
+struct WarpParams {
+    float rotation[16] = {}; // column-major mat4, rotation in the upper-left 3x3
+    float leftTans[4] = {}; // tanLeft, tanRight, tanUp, tanDown
+    float rightTans[4] = {};
+    u32 enabled = 0;
+    u32 _padding[3] = {};
+};
+static_assert(sizeof(WarpParams) == 112);
 
 struct RendererCreateInfo {
     vk::Format format;
@@ -75,7 +91,8 @@ namespace detail {
             vk::CommandBuffer cmdBuf,
             vk::ImageView in,
             vk::ImageView out,
-            vk::Extent2D outSize
+            vk::Extent2D outSize,
+            WarpParams const* warp
         );
 
         void destroy(VkContext const& ctx);
@@ -84,10 +101,19 @@ namespace detail {
 }
 
 class Renderer {
+public:
+    // Replace the imported input images with a new swap texture set of the
+    // same extent and format. Inputs are only ever copy sources, so nothing
+    // else in the pipeline needs rebuilding. Caller must ensure no rendering
+    // is in flight (render() waits its completion semaphore before returning).
+    void swapInputs(VkContext const& vkCtx, std::array<int, ImageCount> const& fds);
+
+private:
     vk::Extent2D eyeExtent;
     vk::Extent2D outExtent;
 
     Image inputImages[ImageCount];
+    vk::ImageCreateInfo savedInputImgCI {};
     Image stagingImgs[StagingImgCount];
     Output output;
 
@@ -96,13 +122,35 @@ class Renderer {
     vk::CommandBuffer cmdBuf;
     vk::Sampler sampler;
     vk::DescriptorSetLayout descLayout;
-    vk::Fence fence;
 
     std::vector<detail::RenderPipeline> pipes;
 
-    // vk::Semaphore renderFinishedSem;
+    WarpParams warpParams {};
+
+    vk::Semaphore renderFinishedSem;
+    uint64_t nextSignalValue = 1;
+    uint64_t lastSubmittedValue = 0;
 
 public:
+    vk::Semaphore getRenderFinishedSemaphore() const { return renderFinishedSem; }
+    uint64_t getLastSubmittedValue() const { return lastSubmittedValue; }
+    void waitForRenderDone(VkContext const& vkCtx) const {
+        if (renderFinishedSem == VK_NULL_HANDLE) {
+            return;
+        }
+
+        vk::SemaphoreWaitInfo waitInfo {
+            .semaphoreCount = 1,
+            .pSemaphores = &renderFinishedSem,
+            .pValues = &lastSubmittedValue,
+        };
+
+        auto result = vkCtx.dev.waitSemaphores(waitInfo, UINT64_MAX);
+        if (result != vk::Result::eSuccess && result != vk::Result::eTimeout) {
+            throw std::runtime_error("Failed waiting for render completion semaphore");
+        }
+    }
+
     Renderer(
         VkContext const& vkCtx,
         RendererCreateInfo& createInfo,
@@ -113,7 +161,16 @@ public:
 
     // NOTE: Use the output immediately afterwards, as this synchronizes to the end of gpu
     // operations
-    void render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx);
+    // waitFds, when given, are sync_file fds imported as temporary semaphores
+    // the submission waits on before its transfer stage (the input writers'
+    // fences). Successful import hands the fd to Vulkan; failed import closes
+    // it here.
+    void render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const waitFds[2] = nullptr);
+
+    // Warp parameters pushed to every pass of the next render() call. The
+    // caller owns the cadence: set before each render, or leave the default
+    // zero struct for exact passthrough.
+    void setWarpParams(WarpParams const& params) { warpParams = params; }
 
     Output getOutput() { return output; }
 
