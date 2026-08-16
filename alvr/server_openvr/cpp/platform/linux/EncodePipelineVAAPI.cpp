@@ -19,6 +19,11 @@ namespace {
 
 using alvr::Vendor;
 
+// Last bitrate target delivered by the manager, shared across encoder
+// instances: renegotiation rebuilds the pipeline mid-session and the manager
+// does not repeat unchanged values.
+int64_t last_known_bitrate_bps = 0;
+
 const char* encoder(ALVR_CODEC codec) {
     switch (codec) {
     case ALVR_CODEC_H264:
@@ -233,10 +238,22 @@ alvr::EncodePipelineVAAPI::EncodePipelineVAAPI(
     encoder_ctx->max_b_frames = 0;
     encoder_ctx->color_range = AVCOL_RANGE_JPEG;
 
-    auto params = FfiDynamicEncoderParams {};
+    // Initialize rate control from the bitrate manager's current target, the
+    // way the deleted CEncoder path effectively did (settings changes rebuild
+    // the encoder, so construction time is when the configured bitrate takes
+    // effect). The old hardcoded 30 Mbps here capped every stream regardless
+    // of settings. The manager reports a value only ONCE per change, and the
+    // first encoder of a session consumes it; texture-set renegotiation
+    // rebuilds this pipeline mid-session (Home to app and back), so those
+    // rebuilds must reuse the last delivered target rather than fall back to
+    // the default, which showed up as bitrate collapsing on app launch.
+    auto params = GetDynamicEncoderParams();
+    if (!params.updated || params.bitrate_bps <= 0) {
+        params.bitrate_bps = last_known_bitrate_bps > 0 ? last_known_bitrate_bps : 30'000'000;
+    }
     params.updated = true;
-    params.bitrate_bps = 30'000'000;
     params.framerate = settings->m_refreshRate;
+    Info("VAAPI init bitrate: %.1f Mbps\n", params.bitrate_bps / 1e6);
     SetParams(params);
 
     vlVaQualityBits quality = {};
@@ -310,7 +327,6 @@ alvr::EncodePipelineVAAPI::EncodePipelineVAAPI(
     AVFilterInOut* outputs = avfilter_inout_alloc();
     AVFilterInOut* inputs = avfilter_inout_alloc();
 
-    // TODO: Respect colorspace
     std::stringstream buffer_filter_args;
     buffer_filter_args << "video_size=" << mapped_frame->width << "x" << mapped_frame->height;
     buffer_filter_args << ":time_base=" << encoder_ctx->time_base.num << "/"
@@ -322,6 +338,15 @@ alvr::EncodePipelineVAAPI::EncodePipelineVAAPI(
     AVBufferSrcParameters* par = av_buffersrc_parameters_alloc();
     par->format = mapped_frame->format;
     par->hw_frames_ctx = av_buffer_ref(mapped_frame->hw_frames_ctx);
+    // Colorspace of the submitted content; the frames carry the same tags
+    // from make_av_frame. This is what makes the filter graph respect it.
+    // AVBufferSrcParameters only grew these fields with FFmpeg 7 (libavfilter
+    // 10). On older FFmpeg the per-frame tags still negotiate through the
+    // graph, so nothing is lost, just set later.
+#if LIBAVFILTER_VERSION_MAJOR >= 10
+    par->color_space = input_frame.colorSpace();
+    par->color_range = input_frame.colorRange();
+#endif
     av_buffersrc_parameters_set(filter_in, par);
     av_free(par);
     if ((err = avfilter_init_str(filter_in, buffer_filter_args.str().c_str()))) {
@@ -420,6 +445,15 @@ void alvr::EncodePipelineVAAPI::SetParams(FfiDynamicEncoderParams params) {
     if (!params.updated) {
         return;
     }
+    // Survives encoder rebuilds: renegotiation re-creates this pipeline and
+    // the manager will not repeat an unchanged value, so remember it.
+    last_known_bitrate_bps = params.bitrate_bps;
+    // Temporary diagnostic: whether runtime updates fire, and with what.
+    // Whether FFmpeg's VAAPI encoder honors post-init rate changes is
+    // unverified; this line plus the wire bitrate settles it empirically.
+    Info(
+        "VAAPI SetParams: %.1f Mbps at %.1f fps\n", params.bitrate_bps / 1e6, params.framerate
+    );
     encoder_ctx->bit_rate = params.bitrate_bps;
     encoder_ctx->framerate = AVRational { int(params.framerate * 1000), 1000 };
     encoder_ctx->rc_buffer_size = encoder_ctx->bit_rate / params.framerate;

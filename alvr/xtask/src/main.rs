@@ -26,12 +26,14 @@ SUBCOMMANDS:
     prepare-deps        Download and compile streamer and client external dependencies
     build-streamer      Build streamer, then copy binaries to build folder
     build-launcher      Build launcher, then copy binaries to build folder
+    build-client-mock   Build the mock client, then copy binaries to build folder
     build-server-lib    Build a C-ABI ALVR server library and header
     build-client        Build client, then copy binaries to build folder
     build-client-lib    Build a C-ABI ALVR client library and header
     build-client-xr-lib Build a C-ABI ALVR OpenXR entry point client library and header
     run-streamer        Build streamer and then open the dashboard
     run-launcher        Build launcher and then open it
+    run-client-mock     Build mock client and then open it
     format              Autoformat all code
     check-format        Check if code is correctly formatted
     package-streamer    Build streamer with distribution profile, make archive
@@ -90,6 +92,13 @@ pub fn run_launcher() {
 
     let launcher_exe = afs::launcher_build_exe_path();
     cmd!(sh, "{launcher_exe}").run().unwrap();
+}
+
+pub fn run_client_mock() {
+    let sh = Shell::new().unwrap();
+
+    let exe = afs::build_dir().join("alvr_client_mock").join(afs::exec_fname("alvr_client_mock"));
+    cmd!(sh, "{exe}").run().unwrap();
 }
 
 pub fn clean() {
@@ -232,6 +241,7 @@ fn main() {
                     build::build_streamer(profile, gpl, None, false, profiling, keep_config)
                 }
                 "build-launcher" => build::build_launcher(profile, false),
+                "build-client-mock" => build::build_client_mock(profile, false),
                 "build-server-lib" => build::build_server_lib(profile, None, false),
                 "build-client" => build::build_android_client(profile),
                 "build-client-lib" => {
@@ -251,6 +261,12 @@ fn main() {
                         build::build_launcher(profile, false);
                     }
                     run_launcher();
+                }
+                "run-client-mock" => {
+                    if !no_rebuild {
+                        build::build_client_mock(profile, false);
+                    }
+                    run_client_mock();
                 }
                 "package-streamer" => {
                     packaging::package_streamer(platform, for_ci, !no_nvidia, gpl, root)

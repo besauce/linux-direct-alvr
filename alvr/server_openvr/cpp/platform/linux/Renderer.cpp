@@ -1,5 +1,6 @@
 #include "Renderer.hpp"
 #include <optional>
+#include <unistd.h>
 #include <vulkan/vulkan_structs.hpp>
 
 namespace alvr::render::detail {
@@ -13,9 +14,18 @@ RenderPipeline::RenderPipeline(
     };
     shader = ctx.dev.createShaderModule(shaderCI);
 
+    // Every pass shares the warp push-constant range; shaders that do not
+    // declare the block simply ignore it.
+    vk::PushConstantRange pushRange {
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = sizeof(WarpParams),
+    };
     vk::PipelineLayoutCreateInfo pipeLayoutCI {
         .setLayoutCount = 1,
         .pSetLayouts = &layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pushRange,
     };
     pipeLayout = ctx.dev.createPipelineLayout(pipeLayoutCI);
 
@@ -47,9 +57,16 @@ void RenderPipeline::render(
     vk::CommandBuffer cmdBuf,
     vk::ImageView in,
     vk::ImageView out,
-    vk::Extent2D outSize
+    vk::Extent2D outSize,
+    WarpParams const* warp
 ) {
     cmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipe);
+
+    if (warp != nullptr) {
+        cmdBuf.pushConstants(
+            pipeLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(WarpParams), warp
+        );
+    }
 
     vk::DescriptorImageInfo descImgInfoIn {
         .imageView = in,
@@ -117,9 +134,13 @@ static bool filter_modifier(uint64_t modifier) {
 
 static u32 to_drm_format(vk::Format format) {
     switch (format) {
+    // DRM fourccs carry no transfer function, so sRGB and UNORM map to the
+    // same code; colorspace is communicated out of band.
     case vk::Format::eB8G8R8A8Unorm:
+    case vk::Format::eB8G8R8A8Srgb:
         return DRM_FORMAT_ARGB8888;
     case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
         return DRM_FORMAT_ABGR8888;
     default:
         // assert(false);
@@ -424,8 +445,11 @@ Renderer::Renderer(
     eyeExtent = createInfo.inputEyeExtent;
     outExtent = createInfo.outputExtent;
 
-    // TODO: This is not standard compliant, but it respects the binary format so only the colors
-    // should be messed up
+    // Images are created UNORM on purpose. The compute passes imageStore into
+    // them and GLSL has no sRGB storage qualifier, FFmpeg's Vulkan format map
+    // has no sRGB entries, and to_drm_format can only describe byte layouts.
+    // The bytes are identical either way; what the content means travels as
+    // colorspace metadata on the frames instead (see Output::contentFormat).
     vk::Format inputFormat = createInfo.format;
     if (inputFormat == vk::Format::eR8G8B8A8Srgb)
         inputFormat = vk::Format::eR8G8B8A8Unorm;
@@ -455,11 +479,22 @@ Renderer::Renderer(
 
     for (int i = 0; i < ImageCount; ++i) {
         inputImages[i] = createImage(vkCtx, inputImgCI, createInfo.inputImgFds[i]);
+        // The compositor process writes into the memory behind these images.
+        // Tracking them as eUndefined lets the first barrier discard that
+        // content (spec: the contents become undefined), so claim eGeneral
+        // from the start and leave visibility to the per frame acquire in
+        // render().
+        inputImages[i].layout = vk::ImageLayout::eGeneral;
     }
+    // Kept so swapInputs can import a replacement set identically.
+    savedInputImgCI = inputImgCI;
 
     auto stagingImgCI = inputImgCI;
     stagingImgCI.extent.width = eyeExtent.width * 2;
-    stagingImgCI.usage = inputImgCI.usage | vk::ImageUsageFlagBits::eTransferDst;
+    // Non-final passes imageStore into staging images, so they need storage
+    // usage; the copy step needs transfer dst.
+    stagingImgCI.usage = inputImgCI.usage | vk::ImageUsageFlagBits::eTransferDst
+        | vk::ImageUsageFlagBits::eStorage;
 
     for (auto& img : stagingImgs) {
         img = createImage(vkCtx, stagingImgCI);
@@ -468,6 +503,9 @@ Renderer::Renderer(
     output = createOutputImage(
         vkCtx, createInfo.outputExtent, stagingImgCI.format, HandleType::DmaBuf
     );
+    // What SteamVR actually submitted, before the UNORM normalization above.
+    // Rides to VkFrame so the encoder can tag transfer/primaries/range.
+    output.contentFormat = (VkFormat)createInfo.format;
 
     vk::QueryPoolCreateInfo poolCI {
         .queryType = vk::QueryType::eTimestamp,
@@ -492,9 +530,11 @@ Renderer::Renderer(
         .magFilter = vk::Filter::eLinear,
         .minFilter = vk::Filter::eLinear,
         .mipmapMode = vk::SamplerMipmapMode::eLinear,
-        .addressModeU = vk::SamplerAddressMode::eRepeat,
-        .addressModeV = vk::SamplerAddressMode::eRepeat,
-        .addressModeW = vk::SamplerAddressMode::eRepeat,
+        // Passes sample at the image edge when the encode target is padded;
+        // repeat would blend the opposite border in. Clamp instead.
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
 
         .anisotropyEnable = true,
         .maxAnisotropy = 16.f,
@@ -537,12 +577,39 @@ Renderer::Renderer(
     vk::SemaphoreCreateInfo semCI {
         .pNext = &timelineCI,
     };
-    // renderFinishedSem = vkCtx.dev.createSemaphore(semCI);
-
-    fence = vkCtx.dev.createFence({});
+    renderFinishedSem = vkCtx.dev.createSemaphore(semCI);
 }
 
-void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx) {
+void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx, int const waitFds[2]) {
+    // Import the input writers' sync files as temporary binary semaphores;
+    // the submission below waits on them at the transfer stage, so the eye
+    // copies start exactly when the writes complete. A successful import
+    // transfers fd ownership to Vulkan; a failed one closes the fd here and
+    // the frame proceeds unguarded (same as the caller's fallback path).
+    vk::Semaphore importedSems[2] = {};
+    u32 importedCount = 0;
+    if (waitFds != nullptr) {
+        for (int e = 0; e < 2; ++e) {
+            if (waitFds[e] < 0) {
+                continue;
+            }
+            vk::Semaphore sem = vkCtx.dev.createSemaphore({});
+            vk::ImportSemaphoreFdInfoKHR importInfo {
+                .semaphore = sem,
+                .flags = vk::SemaphoreImportFlagBits::eTemporary,
+                .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,
+                .fd = waitFds[e],
+            };
+            if (vkCtx.dev.importSemaphoreFdKHR(&importInfo, vkCtx.dispatch)
+                == vk::Result::eSuccess) {
+                importedSems[importedCount++] = sem;
+            } else {
+                vkCtx.dev.destroy(sem);
+                close(waitFds[e]);
+            }
+        }
+    }
+
     vk::CommandBufferBeginInfo beginInfo {};
     cmdBuf.begin(beginInfo);
 
@@ -591,10 +658,41 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx) {
 
     // Copy the left and right eye images into the first working image.
     Image* stageOut = pipes.empty() ? &output.image : &stagingImgs[0];
-    transitionImage(inputImages[leftIdx], vk::ImageLayout::eGeneral, vk::AccessFlagBits::eNone,
-                    vk::AccessFlagBits::eTransferRead, barriers);
-    transitionImage(inputImages[rightIdx], vk::ImageLayout::eGeneral, vk::AccessFlagBits::eNone,
-                    vk::AccessFlagBits::eTransferRead, barriers);
+
+    // The input images are written by another process. transitionImage emits
+    // nothing once the layout settles at eGeneral, which leaves the copies
+    // with no barrier at all against those external writes. Emit an explicit
+    // queue family acquire every frame instead, so the driver performs the
+    // cache invalidation that makes the compositor's writes visible, and
+    // release afterwards so the next acquire has a matching pair.
+    auto externalTransfer = [&](Image& image,
+                                u32 srcQueueFamily,
+                                u32 dstQueueFamily,
+                                vk::AccessFlags srcAccessMask,
+                                vk::AccessFlags dstAccessMask,
+                                std::vector<vk::ImageMemoryBarrier>& barriers) {
+        barriers.push_back(vk::ImageMemoryBarrier {
+            .srcAccessMask = srcAccessMask,
+            .dstAccessMask = dstAccessMask,
+            .oldLayout = image.layout,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = srcQueueFamily,
+            .dstQueueFamilyIndex = dstQueueFamily,
+            .image = image.image,
+            .subresourceRange {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        });
+        image.layout = vk::ImageLayout::eGeneral;
+    };
+    externalTransfer(inputImages[leftIdx], VK_QUEUE_FAMILY_EXTERNAL, vkCtx.meta.queueFamily,
+                     vk::AccessFlagBits::eNone, vk::AccessFlagBits::eTransferRead, barriers);
+    externalTransfer(inputImages[rightIdx], VK_QUEUE_FAMILY_EXTERNAL, vkCtx.meta.queueFamily,
+                     vk::AccessFlagBits::eNone, vk::AccessFlagBits::eTransferRead, barriers);
     transitionImage(*stageOut, vk::ImageLayout::eGeneral, vk::AccessFlagBits::eNone,
                     vk::AccessFlagBits::eTransferWrite, barriers);
 
@@ -644,6 +742,15 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx) {
     };
     cmdBuf.copyImage2KHR(rightCopyInfo, vkCtx.dispatch);
 
+    // Hand the inputs back to the external queue family now that the copies
+    // are recorded. The compositor's next writes then land between a release
+    // and the next frame's acquire.
+    externalTransfer(inputImages[leftIdx], vkCtx.meta.queueFamily, VK_QUEUE_FAMILY_EXTERNAL,
+                     vk::AccessFlagBits::eTransferRead, vk::AccessFlagBits::eNone, barriers);
+    externalTransfer(inputImages[rightIdx], vkCtx.meta.queueFamily, VK_QUEUE_FAMILY_EXTERNAL,
+                     vk::AccessFlagBits::eTransferRead, vk::AccessFlagBits::eNone, barriers);
+    flushBarriers(barriers, vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe);
+
     prev = stageOut;
 
     for (usize pipeIdx = 0; pipeIdx < pipes.size(); ++pipeIdx) {
@@ -672,7 +779,7 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx) {
         flushBarriers(barriers, vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader,
                       vk::PipelineStageFlagBits::eComputeShader);
 
-        pipes[pipeIdx].render(vkCtx, cmdBuf, prev->view, nextOut->view, targetExtent);
+        pipes[pipeIdx].render(vkCtx, cmdBuf, prev->view, nextOut->view, targetExtent, &warpParams);
         prev = nextOut;
     }
 
@@ -681,33 +788,74 @@ void Renderer::render(VkContext& vkCtx, u32 leftIdx, u32 rightIdx) {
 
     cmdBuf.end();
 
-    // vk::TimelineSemaphoreSubmitInfo timelineInfo {
-    //     .waitSemaphoreValueCount = 1,
-    //     .pWaitSemaphoreValues = &waitValue,
-    // };
-    vk::PipelineStageFlags waitStage = vk::PipelineStageFlagBits::eBottomOfPipe;
+    uint64_t signalValue = nextSignalValue++;
+    lastSubmittedValue = signalValue;
+
+    // One submit both waits on the imported dma-buf semaphores and signals
+    // the completion timeline. The imported semaphores are binary, so no
+    // wait values are needed.
+    vk::TimelineSemaphoreSubmitInfo timelineInfo {
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &signalValue,
+    };
+    vk::PipelineStageFlags waitStages[2] = {
+        vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eTransfer,
+    };
     vk::SubmitInfo submitInfo {
-        // .pNext = &timelineInfo,
-        // .waitSemaphoreCount = 1,
-        // .pWaitSemaphores = &renderFinishedSem,
-        .pWaitDstStageMask = &waitStage,
+        .pNext = &timelineInfo,
+        .waitSemaphoreCount = importedCount,
+        .pWaitSemaphores = importedSems,
+        .pWaitDstStageMask = waitStages,
         .commandBufferCount = 1,
         .pCommandBuffers = &cmdBuf,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &renderFinishedSem,
     };
 
-    vkCtx.useQueue([&](auto& queue) { queue.submit(submitInfo, fence); });
-    assert(vkCtx.dev.waitForFences(fence, true, UINT64_MAX) == vk::Result::eSuccess);
-    vkCtx.dev.resetFences(fence);
+    vkCtx.useQueue([&](auto& queue) { queue.submit(submitInfo); });
+
+    // Block on the completion timeline before destroying the temporary
+    // imported semaphores below: the queue still waits on them until the
+    // submission finishes. A failed wait must throw, not fall through to
+    // the destroys; there is no fence behind this wait anymore.
+    vk::SemaphoreWaitInfo waitInfo {
+        .semaphoreCount = 1,
+        .pSemaphores = &renderFinishedSem,
+        .pValues = &signalValue,
+    };
+    if (vkCtx.dev.waitSemaphores(waitInfo, UINT64_MAX) != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed waiting for render completion semaphore");
+    }
+
+    for (u32 i = 0; i < importedCount; ++i) {
+        vkCtx.dev.destroy(importedSems[i]);
+    }
+}
+
+void Renderer::swapInputs(VkContext const& vkCtx, std::array<int, ImageCount> const& fds) {
+    for (auto& img : inputImages) {
+        img.destroy(vkCtx);
+        // Null the handles right away: if an import below throws, destroy()
+        // walks this array again, and destroying a stale handle is undefined
+        // behavior while destroying a null one is a no-op.
+        img = {};
+    }
+    for (int i = 0; i < ImageCount; ++i) {
+        inputImages[i] = createImage(vkCtx, savedInputImgCI, fds[i]);
+        // Same contract as the import in the constructor: the memory already
+        // holds compositor content, never let a barrier treat it as undefined.
+        inputImages[i].layout = vk::ImageLayout::eGeneral;
+    }
 }
 
 void Renderer::destroy(VkContext const& ctx) {
-    // ctx.dev.destroy(renderFinishedSem);
+    ctx.dev.destroy(renderFinishedSem);
 
     for (auto& pipe : pipes) {
         pipe.destroy(ctx);
     }
 
-    ctx.dev.destroy(fence);
     ctx.dev.destroy(descLayout);
     ctx.dev.destroy(sampler);
 

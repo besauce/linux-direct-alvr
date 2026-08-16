@@ -12,8 +12,10 @@ use eframe::{
 };
 use std::{
     f32::consts::{FRAC_PI_2, PI},
+    io::Write,
+    process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         mpsc::{self, TryRecvError},
     },
     thread,
@@ -185,6 +187,71 @@ fn tracking_thread(
     }
 }
 
+#[derive(Default)]
+struct FfplayPipe {
+    child: Option<Child>,
+}
+
+impl FfplayPipe {
+    fn start(&mut self, width: u32, height: u32) {
+        if self.child.is_some() {
+            return;
+        }
+
+        let mut ffplay = Command::new("ffplay");
+        ffplay
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-fflags")
+            .arg("nobuffer")
+            .arg("-f")
+            .arg("h264")
+            .arg("-video_size")
+            .arg(format!("{width}x{height}"))
+            .arg("-i")
+            .arg("-")
+            .arg("-autoexit")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        match ffplay.spawn() {
+            Ok(child) => {
+                self.child = Some(child);
+            }
+            Err(err) => {
+                eprintln!("Failed to start ffplay: {err}");
+            }
+        }
+    }
+
+    fn push_nal(&mut self, nal: &[u8]) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+
+        let Some(stdin) = child.stdin.as_mut() else {
+            return;
+        };
+
+        if let Err(err) = stdin.write_all(nal) {
+            eprintln!("Failed to write ffplay input: {err}");
+            let _ = child.kill();
+            let _ = child.wait();
+            self.child = None;
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+    }
+}
+
 fn client_thread(
     output_sender: mpsc::Sender<WindowOutput>,
     input_receiver: mpsc::Receiver<WindowInput>,
@@ -203,6 +270,16 @@ fn client_thread(
         prefer_hdr: false,
     };
     let client_core_context = Arc::new(ClientCoreContext::new(capabilities));
+
+    let ffplay = Arc::new(Mutex::new(FfplayPipe::default()));
+
+    client_core_context.set_decoder_input_callback(Box::new({
+        let ffplay = Arc::clone(&ffplay);
+        move |_, nal| {
+            ffplay.lock().unwrap().push_nal(nal);
+            true
+        }
+    }));
 
     client_core_context.resume();
 
@@ -227,6 +304,11 @@ fn client_thread(
                     window_output.connected = true;
                     window_output.resolution = config.negotiated_config.view_resolution;
 
+                    ffplay
+                        .lock()
+                        .unwrap()
+                        .start(window_output.resolution.x, window_output.resolution.y);
+
                     streaming.set(true);
 
                     let context = Arc::clone(&client_core_context);
@@ -244,6 +326,7 @@ fn client_thread(
                 ClientCoreEvent::StreamingStopped => {
                     streaming.set(false);
                     got_decoder_config.set(false);
+                    ffplay.lock().unwrap().stop();
 
                     if let Some(thread) = maybe_tracking_thread.take() {
                         thread.join().ok();
